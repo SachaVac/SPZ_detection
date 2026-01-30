@@ -3,21 +3,23 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Full-Field SPZ Scanner</title>
+    <title>Pro SPZ Scanner - CZ Edition</title>
     <script src='https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js'></script>
     <style>
-        body { margin: 0; background: #1a1a1a; color: white; font-family: sans-serif; text-align: center; }
-        #video { width: 100%; max-height: 70vh; background: black; }
-        #controls { padding: 20px; }
+        body { margin: 0; background: #000; color: white; font-family: sans-serif; text-align: center; }
+        #video { width: 100%; max-height: 60vh; background: #111; object-fit: cover; }
+        #controls { padding: 15px; background: #222; }
         #snapBtn { 
-            padding: 15px 40px; font-size: 18px; border-radius: 30px; 
-            border: none; background: #28a745; color: white; cursor: pointer;
+            padding: 18px 35px; font-size: 18px; border-radius: 50px; 
+            border: none; background: #ffffff; color: #000; font-weight: bold; cursor: pointer;
         }
+        #snapBtn:disabled { background: #555; }
         #result-display {
-            margin: 20px; padding: 20px; background: #333; border-radius: 10px;
-            font-size: 24px; font-weight: bold; border: 2px solid #555;
+            margin: 15px; padding: 25px; background: #fff; color: #000; border-radius: 5px;
+            font-size: 32px; font-weight: bold; letter-spacing: 3px; border: 4px solid #003366;
+            min-height: 40px; text-transform: uppercase;
         }
-        .status { color: #aaa; font-size: 14px; margin-bottom: 10px; }
+        .status { color: #00ff00; font-size: 14px; margin-bottom: 10px; height: 20px; }
         canvas { display: none; }
     </style>
 </head>
@@ -26,12 +28,11 @@
     <video id="video" autoplay playsinline></video>
     
     <div id="controls">
-        <div id="status" class="status">Kamera připravena</div>
-        <button id="snapBtn">Hledat SPZ v celém obraze</button>
+        <div id="status" class="status">Inicializace...</div>
+        <button id="snapBtn" disabled>SKENOVAT AUTO</button>
     </div>
 
     <div id="result-display">---</div>
-
     <canvas id="canvas"></canvas>
 
     <script>
@@ -44,61 +45,69 @@
         let worker = null;
 
         async function init() {
-            const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
-            video.srcObject = stream;
-            
-            status.innerText = "Načítám inteligentní model (cca 10s)...";
-            worker = await Tesseract.createWorker('eng');
-            
-            // Nastavení pro "Deep Analysis"
-            await worker.setParameters({
-                tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
-                tessedit_pageseg_mode: '11', // Režim "Sparse text" - hledá text kdekoli v obraze
-            });
-            status.innerText = "Systém připraven k hloubkové analýze";
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { facingMode: "environment", width: { ideal: 1920 } } 
+                });
+                video.srcObject = stream;
+                
+                status.innerText = "Načítám OCR model...";
+                worker = await Tesseract.createWorker('eng');
+                
+                await worker.setParameters({
+                    tessedit_char_whitelist: '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+                    tessedit_pageseg_mode: '7', // "Single line" - ignoruje mřížku okolí
+                });
+
+                status.innerText = "PŘIPRAVENO";
+                snapBtn.disabled = false;
+            } catch (err) {
+                status.innerText = "Chyba kamery: Použijte HTTPS a povolte přístup.";
+            }
         }
 
         snapBtn.addEventListener('click', async () => {
-            status.innerText = "Probíhá hloubková analýza celého obrazu...";
+            status.innerText = "ANALYZUJI SNÍMEK...";
             snapBtn.disabled = true;
-            resultDisplay.innerText = "Pracuji...";
 
             const ctx = canvas.getContext('2d');
             canvas.width = video.videoWidth;
             canvas.height = video.videoHeight;
-            
-            // 1. Zachycení snímku v plném rozlišení
             ctx.drawImage(video, 0, 0);
 
-            // 2. Předzpracování pro vytažení textu z pozadí (Adaptive Thresholding simulace)
+            // PŘEDZPRACOVÁNÍ OBRAZU
             let imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
             let d = imgData.data;
+            
+            // Extrémní kontrastní filtr: Česká SPZ je bílá (jasná), mřížka je tmavší.
+            // Hranice 170 odfiltruje většinu mřížky a nechá jen nápis SPZ.
             for (let i = 0; i < d.length; i += 4) {
-                let gray = 0.3 * d[i] + 0.59 * d[i+1] + 0.11 * d[i+2];
-                // Zvýšíme kontrast – SPZ bývají velmi světlé s velmi tmavým písmem
-                let v = (gray > 120) ? 255 : 0; 
+                let brightness = (0.34 * d[i] + 0.5 * d[i+1] + 0.16 * d[i+2]);
+                let v = (brightness > 170) ? 255 : 0; 
                 d[i] = d[i+1] = d[i+2] = v;
             }
             ctx.putImageData(imgData, 0, 0);
 
-            // 3. Spuštění OCR
-            const { data } = await worker.recognize(canvas.toDataURL('image/jpeg'));
+            // Spuštění OCR
+            const { data: { text } } = await worker.recognize(canvas.toDataURL('image/jpeg'));
             
-            // 4. Inteligentní filtrace výsledků
-            // Hledáme řetězce, které odpovídají formátu SPZ (5-8 znaků, mix písmen a čísel)
-            const words = data.text.split(/[\s\n]+/);
-            const candidates = words.filter(w => {
-                const clean = w.replace(/[^A-Z0-9]/g, '');
-                return clean.length >= 5 && clean.length <= 8;
-            });
+            // Filtrace a formátování výsledku
+            const clean = text.replace(/[^A-Z0-9]/g, '');
+            
+            // Regulární výraz pro českou SPZ (7 znaků, např. 5U60000)
+            const czPattern = clean.match(/[0-9A-Z]{7}/);
 
-            if (candidates.length > 0) {
-                // Vybereme nejdelší/nejpravděpodobnější kandidáty
-                resultDisplay.innerText = candidates.join(' | ');
-                status.innerText = "Analýza dokončena.";
+            if (czPattern) {
+                const res = czPattern[0];
+                // Formátování pro hezčí zobrazení: 5U6 0000
+                resultDisplay.innerText = res.slice(0, 3) + " " + res.slice(3);
+                status.innerText = "ÚSPĚŠNĚ DETEKOVÁNO";
+            } else if (clean.length >= 5) {
+                resultDisplay.innerText = clean;
+                status.innerText = "NALEZENO (NEÚPLNÉ)";
             } else {
-                resultDisplay.innerText = "SPZ nenalezena";
-                status.innerText = "Zkuste změnit úhel nebo vzdálenost.";
+                resultDisplay.innerText = "ZKUSTE ZNOVU";
+                status.innerText = "Mřížka chladiče ruší signál.";
             }
 
             snapBtn.disabled = false;
