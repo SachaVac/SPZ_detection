@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OCR SPZ Fotoaparát</title>
+    <script src='https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js'></script>
+    <style>
+        body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+            text-align: center; 
+            margin: 0; 
+            background: #222; 
+            color: white; 
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+        }
+        
+        /* Oblast videa */
+        #cam-container {
+            position: relative;
+            flex-grow: 1;
+            overflow: hidden;
+            background: #000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        video {
+            width: 100%;
+            height: 100%;
+            object-fit: cover; /* Aby video vyplnilo celou obrazovku */
+        }
+
+        canvas { display: none; } /* Skryté plátno pro výpočty */
+
+        /* Ovládací panel dole */
+        #controls {
+            background: #111;
+            padding: 20px;
+            border-top: 1px solid #444;
+        }
+
+        /* Tlačítko spouště */
+        #snapBtn {
+            width: 70px;
+            height: 70px;
+            border-radius: 50%;
+            background-color: white;
+            border: 4px solid #ddd;
+            cursor: pointer;
+            outline: none;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.5);
+        }
+        #snapBtn:active { background-color: #ccc; transform: scale(0.95); }
+        
+        #resetBtn {
+            display: none; /* Zobrazí se až po vyfocení */
+            padding: 15px 30px;
+            font-size: 18px;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            width: 100%;
+        }
+
+        /* Výsledková oblast */
+        #result-overlay {
+            position: absolute;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 90%;
+            z-index: 10;
+            pointer-events: none;
+        }
+
+        .spz-box {
+            background: white;
+            color: black;
+            padding: 15px;
+            border-radius: 10px;
+            border: 3px solid #003366;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.5);
+            font-size: 24px;
+            font-weight: bold;
+            letter-spacing: 2px;
+            display: none; /* Skryté defaultně */
+        }
+        
+        .loading {
+            color: yellow;
+            font-weight: bold;
+            text-shadow: 1px 1px 2px black;
+            display: none;
+        }
+
+        /* Pomocný rámeček pro míření */
+        .guide-box {
+            position: absolute;
+            border: 2px dashed rgba(255, 255, 255, 0.5);
+            width: 80%;
+            height: 20%;
+            top: 40%;
+            left: 10%;
+            pointer-events: none;
+            box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.3); /* Ztmaví okolí */
+        }
+
+    </style>
+</head>
+<body>
+
+    <div id="cam-container">
+        <video id="video" autoplay playsinline></video>
+        <div class="guide-box"></div> <canvas id="canvas"></canvas>
+        
+        <div id="result-overlay">
+            <div id="loadingText" class="loading">Zpracovávám obraz...</div>
+            <div id="resultBox" class="spz-box">---</div>
+        </div>
+    </div>
+
+    <div id="controls">
+        <button id="snapBtn" title="Vyfotit"></button>
+        <button id="resetBtn">Vyfotit další</button>
+    </div>
+
+    <script>
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const snapBtn = document.getElementById('snapBtn');
+        const resetBtn = document.getElementById('resetBtn');
+        const resultBox = document.getElementById('resultBox');
+        const loadingText = document.getElementById('loadingText');
+        
+        let worker = null;
+
+        // 1. Nastartovat kameru
+        async function startCamera() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: "environment" } // Zadní kamera
+                });
+                video.srcObject = stream;
+            } catch (err) {
+                alert("Nelze spustit kameru. Povolte přístup a použijte HTTPS.");
+            }
+        }
+
+        // 2. Inicializovat Tesseract (jen jednou na začátku pro rychlost)
+        async function initOCR() {
+            worker = await Tesseract.createWorker('eng');
+        }
+
+        // 3. Funkce pro předzpracování obrazu (Grayscale + High Contrast)
+        // Toto dramaticky zvyšuje šanci, že OCR přečte SPZ správně
+        function preprocessImage(ctx, width, height) {
+            const imageData = ctx.getImageData(0, 0, width, height);
+            const data = imageData.data;
+            
+            for (let i = 0; i < data.length; i += 4) {
+                // Převod na odstíny šedi
+                const avg = (data[i] + data[i + 1] + data[i + 2]) / 3;
+                
+                // Zvýšení kontrastu (Binarizace) - jednoduchý práh
+                // Pokud je pixel tmavý, udělej ho úplně černý, jinak bílý
+                const threshold = 100; // Hodnota prahu (lze ladit)
+                const color = avg < threshold ? 0 : 255;
+
+                data[i] = color;     // R
+                data[i + 1] = color; // G
+                data[i + 2] = color; // B
+            }
+            ctx.putImageData(imageData, 0, 0);
+        }
+
+        // 4. Hlavní akce - Vyfotit
+        snapBtn.addEventListener('click', async () => {
+            if (!worker) await initOCR();
+
+            // Zmrazit video (efekt vyfocení)
+            video.pause();
+            
+            // UI změny
+            snapBtn.style.display = 'none';
+            loadingText.style.display = 'block';
+            resultBox.style.display = 'none';
+
+            // Přenést obraz na canvas
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(video, 0, 0);
+
+            // Aplikovat filtry pro lepší čitelnost
+            preprocessImage(ctx, canvas.width, canvas.height);
+
+            // Získat DataURL z upraveného obrazu
+            const imgData = canvas.toDataURL('image/jpeg');
+
+            try {
+                // OCR Analýza
+                const { data: { text } } = await worker.recognize(imgData);
+                
+                // Vyčištění textu (chceme jen velká písmena a čísla)
+                // Odstraníme mezery a nealfanumerické znaky
+                const cleanText = text.replace(/[^A-Z0-9]/g, '');
+
+                // Zobrazit výsledek
+                loadingText.style.display = 'none';
+                resultBox.innerText = cleanText || "SPZ nenalezena";
+                resultBox.style.display = 'block';
+                
+                // Zobrazit tlačítko pro restart
+                resetBtn.style.display = 'block';
+
+            } catch (err) {
+                console.error(err);
+                loadingText.innerText = "Chyba při čtení.";
+            }
+        });
+
+        // 5. Reset pro další fotku
+        resetBtn.addEventListener('click', () => {
+            video.play();
+            resultBox.style.display = 'none';
+            resetBtn.style.display = 'none';
+            snapBtn.style.display = 'block';
+            loadingText.style.display = 'none';
+        });
+
+        // Spustit vše při načtení
+        startCamera();
+        initOCR();
+
+    </script>
+</body>
+</html>
